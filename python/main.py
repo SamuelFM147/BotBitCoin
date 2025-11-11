@@ -17,6 +17,7 @@ from data.feature_engineer import FeatureEngineer
 from environment.bitcoin_env import BitcoinTradingEnv
 from models.dqn_agent import DQNAgent
 from training.trainer import Trainer
+from integrations.supabase_client import SupabaseEdgeClient
 from evaluation.backtester import Backtester
 from utils.risk_manager import RiskManager
 
@@ -27,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def train_model(config: Config, data_path: str):
+def train_model(config: Config, data_path: str, agent_id: str = "DQN-v2.1"):
     """Train RL model"""
     logger.info("="*50)
     logger.info("STARTING TRAINING PIPELINE")
@@ -53,7 +54,43 @@ def train_model(config: Config, data_path: str):
     
     # 4. Split data for training and evaluation
     logger.info("\n[4/6] Creating environments...")
-    train_size = int(len(df_normalized) * 0.8)
+    total_rows = len(df_normalized)
+    lookback = config.environment.lookback_window
+    min_window = lookback + 1
+
+    if total_rows < min_window:
+        raise ValueError(
+            f"Dataset após feature engineering/normalização é muito curto: {total_rows} linhas. "
+            f"Necessário pelo menos {min_window} para lookback_window={lookback}."
+        )
+
+    # Para evitar episódios com apenas 1 passo, o conjunto de treino precisa ser
+    # substancialmente maior que o lookback: len(train) >= 2*lookback + 2
+    required_train_rows = 2 * lookback + 2
+
+    # Split padrão 80/20
+    train_size = int(total_rows * 0.8)
+
+    # Ajuste para garantir avaliação mínima
+    if (total_rows - train_size) < min_window:
+        train_size = max(min_window, total_rows - min_window)
+
+    # Garantir tamanho mínimo do treino para episodios com vários passos
+    if train_size < required_train_rows:
+        if total_rows >= required_train_rows:
+            # Concede mais linhas ao treino garantindo avaliação mínima
+            train_size = max(required_train_rows, total_rows - min_window)
+        else:
+            # Dataset muito curto para split; usa todo o dataset para treino e desabilita eval
+            logger.warning(
+                (
+                    f"Dataset ({total_rows} linhas) é insuficiente para split respeitando lookback={lookback}. "
+                    f"Usando todo o dataset para treino e desabilitando avaliação. "
+                    f"Considere reduzir lookback_window ou usar um dataset maior."
+                )
+            )
+            train_size = total_rows
+
     df_train = df_normalized.iloc[:train_size]
     df_eval = df_normalized.iloc[train_size:]
     
@@ -66,13 +103,21 @@ def train_model(config: Config, data_path: str):
         max_position_size=config.environment.max_position_size
     )
     
-    eval_env = BitcoinTradingEnv(
-        df_eval,
-        initial_balance=config.environment.initial_balance,
-        lookback_window=config.environment.lookback_window,
-        transaction_cost=config.environment.transaction_cost,
-        max_position_size=config.environment.max_position_size
-    )
+    # Avaliação: criar somente se houver dados suficientes
+    eval_env = None
+    if len(df_eval) > lookback:
+        eval_env = BitcoinTradingEnv(
+            df_eval,
+            initial_balance=config.environment.initial_balance,
+            lookback_window=lookback,
+            transaction_cost=config.environment.transaction_cost,
+            max_position_size=config.environment.max_position_size
+        )
+    else:
+        logger.warning(
+            f"Conjunto de avaliação insuficiente (linhas={len(df_eval)} < lookback_window+1). "
+            "A avaliação usará o conjunto de treino."
+        )
     
     # 5. Create agent
     logger.info("\n[5/6] Creating DQN agent...")
@@ -94,6 +139,14 @@ def train_model(config: Config, data_path: str):
     )
     
     # 6. Train agent
+    # Supabase client (optional, best-effort). If env vars are missing, training proceeds without persistence.
+    supabase_client = None
+    try:
+        supabase_client = SupabaseEdgeClient()
+        logger.info("Supabase client initialized; episodes and trades will be persisted.")
+    except Exception as e:
+        logger.warning(f"Supabase client not configured: {e}. Proceeding without Supabase persistence.")
+
     logger.info("\n[6/6] Training agent...")
     trainer = Trainer(
         agent=agent,
@@ -105,7 +158,10 @@ def train_model(config: Config, data_path: str):
         early_stopping_patience=config.training.early_stopping_patience,
         min_episodes_before_stopping=config.training.min_episodes_before_stopping,
         log_dir=config.training.log_dir,
-        checkpoint_dir=config.training.checkpoint_dir
+        checkpoint_dir=config.training.checkpoint_dir,
+        supabase_client=supabase_client,
+        agent_id=agent_id,
+        max_steps_per_episode=config.training.max_steps_per_episode,
     )
     
     history = trainer.train()
@@ -191,6 +247,8 @@ def main():
                        help='Path to config file')
     parser.add_argument('--model', type=str, default='checkpoints/best_model.pth',
                        help='Path to model file (for backtest)')
+    parser.add_argument('--agent-id', type=str, default='DQN-v2.1',
+                       help='Identificador do agente para métricas no Supabase')
     
     args = parser.parse_args()
     
@@ -205,7 +263,7 @@ def main():
     
     # Execute based on mode
     if args.mode in ['train', 'both']:
-        agent, history = train_model(config, args.data)
+        agent, history = train_model(config, args.data, agent_id=args.agent_id)
         
         if args.mode == 'both':
             logger.info("\n" + "="*50)

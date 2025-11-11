@@ -59,6 +59,8 @@ class TrainingConfig:
     min_episodes_before_stopping: int = 1000
     log_dir: str = "logs"
     checkpoint_dir: str = "checkpoints"
+    # Optional cap to speed up training by limiting steps per episode
+    max_steps_per_episode: int | None = None
     
 
 @dataclass

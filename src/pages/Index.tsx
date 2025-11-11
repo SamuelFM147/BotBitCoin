@@ -5,8 +5,18 @@ import { TrainingProgress } from "@/components/TrainingProgress";
 import { RecentTrades } from "@/components/RecentTrades";
 import { RiskManagement } from "@/components/RiskManagement";
 import { Bot } from "lucide-react";
+import { useTrainingStatus } from "@/hooks/useTrainingStatus";
 
 const Index = () => {
+  const { data: status } = useTrainingStatus();
+  const lastUpdatedLabel = (() => {
+    if (!status?.timestamp) return "Sem dados";
+    const ts = new Date(status.timestamp).getTime();
+    const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (diffSec < 60) return `Atualizado há ${diffSec}s`;
+    const mins = Math.floor(diffSec / 60);
+    return `Atualizado há ${mins} min`;
+  })();
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
@@ -24,7 +34,7 @@ const Index = () => {
             </div>
             <div className="text-right">
               <p className="text-sm text-muted-foreground">Sistema v2.1.0</p>
-              <p className="text-xs text-muted-foreground">Atualizado há 2 min</p>
+              <p className="text-xs text-muted-foreground">{lastUpdatedLabel}</p>
             </div>
           </div>
         </div>

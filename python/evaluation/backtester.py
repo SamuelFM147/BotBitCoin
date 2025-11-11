@@ -6,6 +6,7 @@ import pandas as pd
 from typing import Dict, List, Any
 import logging
 from datetime import datetime
+from utils.risk_manager import RiskManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -154,7 +155,7 @@ class Backtester:
         else:
             sortino_ratio = 0.0
         
-        return {
+        metrics = {
             'total_return': total_return,
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
@@ -165,6 +166,16 @@ class Backtester:
             'total_trades': len(self.trades),
             'avg_trade_profit': np.mean([t.get('profit_loss', 0) for t in self.trades]) if self.trades else 0
         }
+
+        # Risk metrics (VaR, CVaR, current drawdown, downside deviation)
+        try:
+            rm = RiskManager()
+            risk_metrics = rm.get_risk_metrics(np.array(self.portfolio_values))
+            metrics.update(risk_metrics)
+        except Exception as e:
+            logger.warning(f"Risk metrics calculation failed: {e}")
+
+        return metrics
     
     def calculate_max_drawdown(self, portfolio_values: List[float]) -> float:
         """

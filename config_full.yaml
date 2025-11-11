@@ -1,0 +1,25 @@
+environment:
+  initial_balance: 10000.0
+  max_position_size: 0.3
+  transaction_cost: 0.001
+  reward_scaling: 1.0
+  lookback_window: 20
+
+dqn:
+  learning_rate: 0.00025
+  gamma: 0.99
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay: 0.995
+  batch_size: 64
+  target_update_freq: 1000
+  hidden_layers: [256, 256]
+
+training:
+  total_episodes: 2000
+  eval_frequency: 50
+  checkpoint_frequency: 100
+  early_stopping_patience: 200
+  min_episodes_before_stopping: 500
+  log_dir: logs
+  checkpoint_dir: checkpoints

@@ -1,0 +1,156 @@
+[
+  {
+    "trade_type": "buy",
+    "price": 0.03766217885773547,
+    "executed_price": 0.04169596671673023,
+    "amount": 39827.75414205526,
+    "fee": 1.6606567111092507,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 23,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 0.03766217885773547,
+    "executed_price": 0.033633455436398424,
+    "amount": 39827.75414205526,
+    "fee": 1.3395449940686484,
+    "revenue": 1338.2054490745797,
+    "profit_loss": -322.45126203467106,
+    "step": 23,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "buy",
+    "price": 0.11298653657320641,
+    "executed_price": 0.13138807033213457,
+    "amount": 12845.629720207862,
+    "fee": 1.6877625011392285,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 24,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 0.11298653657320641,
+    "executed_price": 0.09458285478745361,
+    "amount": 12845.629720207862,
+    "fee": 1.2149763304798187,
+    "revenue": 1213.7613541493388,
+    "profit_loss": -474.0011469898899,
+    "step": 24,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "buy",
+    "price": 0.48960832515056113,
+    "executed_price": 0.5743961689377141,
+    "amount": 2818.640543622498,
+    "fee": 1.6190163298692788,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 29,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 0.48960832515056113,
+    "executed_price": 0.40478871284904566,
+    "amount": 2818.640543622498,
+    "fee": 1.1409538776370853,
+    "revenue": 1139.8129237594483,
+    "profit_loss": -479.2034061098303,
+    "step": 29,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "buy",
+    "price": 0.7909057560124448,
+    "executed_price": 0.9285598434299498,
+    "amount": 1653.6818735429001,
+    "fee": 1.5355425815799413,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 33,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 0.7909057560124448,
+    "executed_price": 0.6532867913746695,
+    "amount": 1653.6818735429001,
+    "fee": 1.080328525121293,
+    "revenue": 1079.2481965961717,
+    "profit_loss": -456.2943849837695,
+    "step": 33,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "buy",
+    "price": 1.0168788291588577,
+    "executed_price": 1.1934930379912807,
+    "amount": 1218.66242833356,
+    "fee": 1.4544651238776518,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 36,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 1.0168788291588577,
+    "executed_price": 0.8403496560833269,
+    "amount": 1218.66242833356,
+    "fee": 1.024102552531779,
+    "revenue": 1023.0784499792474,
+    "profit_loss": -431.3866738984045,
+    "step": 36,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "buy",
+    "price": 1.1675275445897997,
+    "executed_price": 1.3694887696362414,
+    "amount": 1005.8056941371437,
+    "fee": 1.3774396025570026,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 38,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 1.1675275445897997,
+    "executed_price": 0.9655781823283314,
+    "amount": 1005.8056941371437,
+    "fee": 0.9711840339204288,
+    "revenue": 970.2128498865085,
+    "profit_loss": -407.22675267049436,
+    "step": 38,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "buy",
+    "price": 1.3181762600207414,
+    "executed_price": 1.5435390203322912,
+    "amount": 844.3599367750013,
+    "fee": 1.3033025096175208,
+    "revenue": null,
+    "profit_loss": null,
+    "step": 40,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  },
+  {
+    "trade_type": "auto_close",
+    "price": 1.3181762600207414,
+    "executed_price": 1.0926736134591533,
+    "amount": 844.3599367750013,
+    "fee": 0.9226098231760829,
+    "revenue": 921.6872133529067,
+    "profit_loss": -381.615296264614,
+    "step": 40,
+    "timestamp": "2025-11-10T17:16:11.585379Z"
+  }
+]

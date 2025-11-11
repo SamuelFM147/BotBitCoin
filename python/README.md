@@ -43,6 +43,53 @@ venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
+### Alternativa Recomendada: Poetry
+
+Você pode gerenciar dependências com Poetry para maior reprodutibilidade e isolamento de ambiente.
+
+1. Instale o Poetry (Windows/Linux/Mac):
+```bash
+# Recomendado: via pipx
+python -m pip install --user pipx
+pipx install poetry
+
+# Alternativa: instalador oficial
+curl -sSL https://install.python-poetry.org | python -
+```
+
+2. Instale o ambiente e dependências:
+```bash
+poetry install
+```
+
+3. Execute comandos no ambiente Poetry:
+```bash
+# Treinar
+poetry run python python/main.py --mode train --data data/bitcoin_historical.csv
+
+# Backtest
+poetry run python python/main.py --mode backtest --data data/bitcoin_test.csv --model checkpoints/best_model.pth
+
+# Testes
+poetry run pytest -q
+```
+
+4. Exportar `requirements.txt` para compatibilidade (opcional):
+```bash
+poetry export -f requirements.txt --output python/requirements.txt --without-hashes
+```
+
+Notas:
+- Por padrão, o Poetry usa um venv fora do projeto. Se preferir `.venv` dentro do repo, habilite:
+```bash
+poetry config virtualenvs.in-project true
+```
+- Para usar PyTorch com GPU, instale a variante CUDA conforme sua versão:
+```bash
+# Exemplo CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
 ## 📊 Preparação de Dados
 
 ### Formato dos Dados
@@ -354,3 +401,40 @@ Contribuições são bem-vindas! Por favor:
 ## ⚠️ Disclaimer
 
 Este sistema é para fins educacionais e de pesquisa. Não constitui aconselhamento financeiro. Trading de criptomoedas envolve riscos significativos de perda. Use por sua conta e risco.
+
+---
+
+## 🔌 Integração com Supabase (episódios e trades)
+
+Para persistir dados de treinamento em tempo real no Supabase usando a Edge Function `rl-training`:
+
+- Configure variáveis de ambiente no arquivo `.env` na raiz (compartilhadas com o frontend):
+
+```
+VITE_SUPABASE_URL="https://<project-ref>.supabase.co"
+VITE_SUPABASE_PUBLISHABLE_KEY="<anon-key>"
+```
+
+- O cliente Python deriva automaticamente a URL da função: `https://<project-ref>.functions.supabase.co/rl-training`.
+
+- Uso no `Trainer`:
+
+```python
+from integrations.supabase_client import SupabaseEdgeClient
+from training.trainer import Trainer
+
+supabase = SupabaseEdgeClient()  # lê .env
+trainer = Trainer(agent, env, eval_env, supabase_client=supabase, agent_id="DQN-v2.1")
+history = trainer.train()
+```
+
+- Episódios persistidos: `agent_id`, `episode_number`, `total_reward`, `avg_loss`, `epsilon`, `actions_taken`, `duration_seconds`
+- Trades persistidos: `agent_id`, `episode_id`, `trade_type`, `price`, `amount`, `profit_loss`, `confidence (opcional)`
+
+Resiliência:
+- Chamadas usam retries e logs em falhas; o loop de treinamento continua mesmo sem conexão.
+- Para desativar temporariamente os retries, defina `SUPABASE_DISABLE_RETRIES="true"` no `.env`.
+- Para ajustar explicitamente o número de tentativas, use `SUPABASE_MAX_RETRIES` (mínimo 1). Ex.: `SUPABASE_MAX_RETRIES=1`.
+
+Testes:
+- Incluímos testes unitários do cliente e teste de integração do `Trainer` com mocks de rede.

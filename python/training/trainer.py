@@ -29,7 +29,10 @@ class Trainer:
                  early_stopping_patience: int = 50,
                  min_episodes_before_stopping: int = 1000,
                  log_dir: str = "logs",
-                 checkpoint_dir: str = "checkpoints"):
+                 checkpoint_dir: str = "checkpoints",
+                 supabase_client=None,
+                 agent_id: str = "DQN-v2.1",
+                 max_steps_per_episode: int | None = None):
         """
         Args:
             agent: RL agent to train
@@ -51,12 +54,20 @@ class Trainer:
         self.checkpoint_frequency = checkpoint_frequency
         self.early_stopping_patience = early_stopping_patience
         self.min_episodes_before_stopping = min_episodes_before_stopping
+        self.max_steps_per_episode = max_steps_per_episode
         
         # Create directories
         self.log_dir = log_dir
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
+        # Frontend public dir (para consumo direto pelo app web)
+        self.public_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "public")
+        try:
+            os.makedirs(self.public_dir, exist_ok=True)
+        except Exception:
+            # Se não conseguir criar, mantém apenas logs/checkpoints
+            pass
         
         # Training history
         self.history = {
@@ -71,6 +82,10 @@ class Trainer:
         # Best model tracking
         self.best_reward = -np.inf
         self.episodes_without_improvement = 0
+
+        # Supabase integration (optional)
+        self.supabase = supabase_client
+        self.agent_id = agent_id
         
         logger.info("Trainer initialized")
     
@@ -86,6 +101,7 @@ class Trainer:
         episode_loss = 0
         steps = 0
         done = False
+        start_time = datetime.utcnow()
         
         while not done:
             # Select and perform action
@@ -103,8 +119,14 @@ class Trainer:
             episode_loss += loss
             steps += 1
             state = next_state
+
+            # Optional cap to speed up episodes
+            if self.max_steps_per_episode is not None and steps >= int(self.max_steps_per_episode):
+                truncated = True
+                done = True
         
         avg_loss = episode_loss / steps if steps > 0 else 0
+        duration_seconds = (datetime.utcnow() - start_time).total_seconds()
         
         return {
             'reward': episode_reward,
@@ -112,7 +134,8 @@ class Trainer:
             'steps': steps,
             'portfolio_value': info.get('total_value', 0),
             'profit': info.get('profit', 0),
-            'n_trades': info.get('n_trades', 0)
+            'n_trades': info.get('n_trades', 0),
+            'duration_seconds': duration_seconds
         }
     
     def evaluate(self, n_episodes: int = 5) -> Dict[str, float]:
@@ -184,6 +207,39 @@ class Trainer:
                 'profit': f"${stats['profit']:.2f}",
                 'epsilon': f"{self.agent.epsilon:.3f}"
             })
+
+            # Persist episode and trades to Supabase (best-effort)
+            if self.supabase is not None:
+                try:
+                    resp = self.supabase.save_episode(
+                        agent_id=self.agent_id,
+                        episode_number=episode + 1,
+                        total_reward=float(stats['reward']),
+                        avg_loss=float(stats['loss']),
+                        epsilon=float(self.agent.epsilon),
+                        actions_taken=int(stats['steps']),
+                        duration_seconds=float(stats.get('duration_seconds', 0.0)),
+                    )
+                    episode_row = resp.get('episode') or {}
+                    episode_id = episode_row.get('id')
+                    # Persist trades if the environment exposes them
+                    trades = getattr(self.env, 'trades', [])
+                    if episode_id is not None and trades:
+                        self.supabase.save_trades_batch(
+                            agent_id=self.agent_id,
+                            episode_id=episode_id,
+                            trades=trades,
+                            default_confidence=None,
+                        )
+                except Exception as e:
+                    logger.warning(f"Supabase persistence failed for episode {episode + 1}: {e}")
+
+            # Atualiza arquivos consumidos pelo frontend (status e trades) a cada episódio
+            try:
+                self._save_frontend_status(stats, episode)
+                self._save_frontend_trades()
+            except Exception as e:
+                logger.warning(f"Falha ao salvar arquivos de status/trades no public: {e}")
             
             # Evaluation
             if (episode + 1) % self.eval_frequency == 0:
@@ -252,12 +308,81 @@ class Trainer:
             json.dump(history_serializable, f, indent=2)
         
         logger.info(f"History saved to {history_path}")
+        # Espelha também em /public para o frontend consumir como fallback
+        try:
+            public_history_path = os.path.join(self.public_dir, 'training_history.json')
+            with open(public_history_path, 'w') as f:
+                json.dump(history_serializable, f, indent=2)
+            logger.info(f"History mirrored to {public_history_path}")
+        except Exception as e:
+            logger.warning(f"Não foi possível espelhar histórico no public: {e}")
     
     def load_history(self, filepath: str):
         """Load training history from file"""
         with open(filepath, 'r') as f:
             self.history = json.load(f)
         logger.info(f"History loaded from {filepath}")
+
+    def _save_frontend_status(self, stats: Dict[str, Any], episode: int):
+        """Salva um arquivo simples com o status em tempo real para o frontend.
+
+        Conteúdo: episódio, epsilon, device, recompensa, perda média, passos, valor de portfólio,
+        lucro, trades no episódio, timestamp e flags de execução.
+        """
+        try:
+            status = {
+                'episode_number': int(episode + 1),
+                'epsilon': float(self.agent.epsilon),
+                'device': str(getattr(self.agent, 'device', 'cpu')),
+                'gpu_available': bool(torch.cuda.is_available()),
+                'reward': float(stats.get('reward', 0.0)),
+                'loss': float(stats.get('loss', 0.0)),
+                'steps': int(stats.get('steps', 0)),
+                'portfolio_value': float(stats.get('portfolio_value', 0.0)),
+                'profit': float(stats.get('profit', 0.0)),
+                'n_trades': int(stats.get('n_trades', 0)),
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'running': True,
+                'agent_id': self.agent_id,
+            }
+            status_path = os.path.join(self.public_dir, 'training_status.json')
+            with open(status_path, 'w') as f:
+                json.dump(status, f, indent=2)
+            logger.info(f"Training status written to {status_path}")
+        except Exception as e:
+            logger.warning(f"Falha ao escrever training_status.json: {e}")
+
+    def _save_frontend_trades(self):
+        """Salva as trades do episódio corrente em /public/trades.json para o frontend.
+
+        O ambiente expõe self.env.trades como lista de dicts; convertemos para um
+        formato simples e serializável.
+        """
+        try:
+            trades = getattr(self.env, 'trades', []) or []
+            # Normaliza tipos para JSON e adiciona timestamp se não existir
+            normalized = []
+            now_iso = datetime.utcnow().isoformat() + 'Z'
+            for t in trades:
+                nt = {
+                    'trade_type': str(t.get('action', 'hold')),
+                    'price': float(t.get('price', 0.0)),
+                    'executed_price': float(t.get('executed_price', t.get('price', 0.0))),
+                    'amount': float(t.get('amount', 0.0)),
+                    'fee': float(t.get('fee', 0.0)),
+                    'revenue': float(t.get('revenue', 0.0)) if t.get('revenue') is not None else None,
+                    'profit_loss': float(t.get('profit_loss', 0.0)) if t.get('profit_loss') is not None else None,
+                    'step': int(t.get('step', 0)),
+                    'timestamp': t.get('timestamp') or now_iso,
+                }
+                normalized.append(nt)
+
+            trades_path = os.path.join(self.public_dir, 'trades.json')
+            with open(trades_path, 'w') as f:
+                json.dump(normalized, f, indent=2)
+            logger.info(f"Trades written to {trades_path}")
+        except Exception as e:
+            logger.warning(f"Falha ao escrever trades.json: {e}")
 
 
 if __name__ == "__main__":

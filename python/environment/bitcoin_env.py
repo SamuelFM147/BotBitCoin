@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Dict, Any
 import logging
+from numpy.random import default_rng, Generator
+from dataclasses import dataclass
+from utils.market_costs import SlippageConfig, compute_slippage_bps, apply_buy, apply_sell
+from utils.risk_manager import RiskManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +30,9 @@ class BitcoinTradingEnv(gym.Env):
                  lookback_window: int = 50,
                  transaction_cost: float = 0.001,
                  max_position_size: float = 0.3,
-                 reward_scaling: float = 1.0):
+                 reward_scaling: float = 1.0,
+                 slippage_config: SlippageConfig | None = None,
+                 reward_include_fee_penalty: bool = False):
         """
         Args:
             df: DataFrame with market data and features
@@ -44,6 +50,8 @@ class BitcoinTradingEnv(gym.Env):
         self.transaction_cost = transaction_cost
         self.max_position_size = max_position_size
         self.reward_scaling = reward_scaling
+        self.slippage_config = slippage_config or SlippageConfig()
+        self.reward_include_fee_penalty = reward_include_fee_penalty
         
         # Get feature columns (exclude OHLCV and timestamp)
         self.feature_cols = [col for col in df.columns 
@@ -61,13 +69,21 @@ class BitcoinTradingEnv(gym.Env):
         
         # Episode tracking
         self.current_step = 0
-        self.max_steps = len(df) - lookback_window - 1
+        # Último índice válido da série. O episódio começa em lookback_window
+        # e termina quando current_step alcança o último índice.
+        # Antes: usava (len(df) - lookback_window - 1), que representa a
+        # quantidade de passos possíveis, mas era comparada diretamente com
+        # current_step, resultando em episódios de 1 passo em datasets curtos.
+        self.max_steps = len(df) - 1
         
         # Portfolio state
         self.balance = initial_balance
         self.btc_held = 0.0
         self.total_profit = 0.0
         self.trades = []
+        self.rng: Generator | None = None
+        self.risk_manager = RiskManager(max_position_size=max_position_size)
+        self.entry_price: float | None = None
         
         logger.info(f"Environment initialized with {self.max_steps} steps")
     
@@ -80,6 +96,8 @@ class BitcoinTradingEnv(gym.Env):
         self.btc_held = 0.0
         self.total_profit = 0.0
         self.trades = []
+        self.rng = default_rng(seed if seed is not None else 42)
+        self.entry_price = None
         
         return self._get_observation(), {}
     
@@ -115,16 +133,16 @@ class BitcoinTradingEnv(gym.Env):
         """
         Calculate reward for the action taken
         """
-        current_price = self.df['close'].iloc[self.current_step]
+        # Evita estouro de índice quando current_step avança além do último índice
+        safe_idx = min(self.current_step, len(self.df) - 1)
+        current_price = self.df['close'].iloc[safe_idx]
         current_value = self.balance + (self.btc_held * current_price)
         
         # Portfolio value change
         value_change = (current_value - previous_value) / self.initial_balance
         
-        # Penalize for transaction costs on trades
-        cost_penalty = 0.0
-        if action != 0:  # If not holding
-            cost_penalty = self.transaction_cost
+        # Fees/slippage already applied directly in balance and holdings.
+        cost_penalty = self.transaction_cost if (self.reward_include_fee_penalty and action != 0) else 0.0
         
         # Risk-adjusted return (penalize excessive exposure)
         position_ratio = (self.btc_held * current_price) / current_value if current_value > 0 else 0
@@ -150,40 +168,109 @@ class BitcoinTradingEnv(gym.Env):
         current_price = self.df['close'].iloc[self.current_step]
         previous_value = self.balance + (self.btc_held * current_price)
         
-        # Execute action
+        # Execute action with slippage & fees; enforce risk constraints
         if action == 1:  # Buy
-            # Calculate how much we can buy
+            # Calculate how much we can buy (respect max position size)
             max_buy = (self.balance * self.max_position_size) / current_price
             buy_amount = max_buy * 0.5  # Buy 50% of maximum allowed
-            
+
+            # Risk check for position sizing
+            total_value = self.balance + (self.btc_held * current_price)
+            if not self.risk_manager.check_position_size(buy_amount * current_price, total_value):
+                buy_amount = 0.0
+
             if buy_amount > 0 and self.balance > buy_amount * current_price:
-                cost = buy_amount * current_price * (1 + self.transaction_cost)
-                self.balance -= cost
-                self.btc_held += buy_amount
-                
-                self.trades.append({
-                    'step': self.current_step,
-                    'action': 'buy',
-                    'price': current_price,
-                    'amount': buy_amount,
-                    'cost': cost
-                })
-        
+                slip_bps = compute_slippage_bps(
+                    self.df['close'].values,
+                    self.current_step,
+                    buy_amount,
+                    'buy',
+                    self.rng,
+                    self.slippage_config,
+                )
+                executed_price, cost, fee = apply_buy(current_price, buy_amount, self.transaction_cost, slip_bps)
+                if self.balance >= cost:
+                    self.balance -= cost
+                    self.btc_held += buy_amount
+                    self.entry_price = executed_price if self.entry_price is None else self.entry_price
+
+                    self.trades.append({
+                        'step': self.current_step,
+                        'action': 'buy',
+                        'price': current_price,
+                        'executed_price': executed_price,
+                        'slippage_bps': slip_bps,
+                        'amount': buy_amount,
+                        'fee': fee,
+                        'cost': cost,
+                    })
+
         elif action == 2:  # Sell
             # Sell 50% of holdings
             sell_amount = self.btc_held * 0.5
-            
+
             if sell_amount > 0:
-                revenue = sell_amount * current_price * (1 - self.transaction_cost)
+                slip_bps = compute_slippage_bps(
+                    self.df['close'].values,
+                    self.current_step,
+                    sell_amount,
+                    'sell',
+                    self.rng,
+                    self.slippage_config,
+                )
+                executed_price, revenue, fee = apply_sell(current_price, sell_amount, self.transaction_cost, slip_bps)
                 self.balance += revenue
                 self.btc_held -= sell_amount
-                
+
+                profit_loss = 0.0
+                if self.entry_price is not None:
+                    # PnL realized for the sold amount
+                    profit_loss = (executed_price - self.entry_price) * sell_amount - fee
+                    # Reset entry price if we fully exit
+                    if self.btc_held <= 1e-12:
+                        self.entry_price = None
+
                 self.trades.append({
                     'step': self.current_step,
                     'action': 'sell',
                     'price': current_price,
+                    'executed_price': executed_price,
+                    'slippage_bps': slip_bps,
                     'amount': sell_amount,
-                    'revenue': revenue
+                    'fee': fee,
+                    'revenue': revenue,
+                    'profit_loss': profit_loss,
+                })
+
+        # Risk-based auto close (stop loss / take profit) if holding
+        if self.btc_held > 0 and self.entry_price is not None:
+            check = self.risk_manager.should_close_position(self.entry_price, current_price, position_type='long')
+            if check['should_close']:
+                sell_amount = self.btc_held
+                slip_bps = compute_slippage_bps(
+                    self.df['close'].values,
+                    self.current_step,
+                    sell_amount,
+                    'sell',
+                    self.rng,
+                    self.slippage_config,
+                )
+                executed_price, revenue, fee = apply_sell(current_price, sell_amount, self.transaction_cost, slip_bps)
+                self.balance += revenue
+                self.btc_held = 0.0
+                profit_loss = (executed_price - self.entry_price) * sell_amount - fee
+                self.entry_price = None
+                self.trades.append({
+                    'step': self.current_step,
+                    'action': 'auto_close',
+                    'reason': check['reason'],
+                    'price': current_price,
+                    'executed_price': executed_price,
+                    'slippage_bps': slip_bps,
+                    'amount': sell_amount,
+                    'fee': fee,
+                    'revenue': revenue,
+                    'profit_loss': profit_loss,
                 })
         
         # Move to next step
@@ -192,7 +279,7 @@ class BitcoinTradingEnv(gym.Env):
         # Calculate reward
         reward = self._calculate_reward(action, previous_value)
         
-        # Check if episode is done
+        # Check if episode is done (atingiu último índice disponível)
         terminated = self.current_step >= self.max_steps
         truncated = False
         
@@ -206,14 +293,16 @@ class BitcoinTradingEnv(gym.Env):
             'profit': current_value - self.initial_balance,
             'balance': self.balance,
             'btc_held': self.btc_held,
-            'n_trades': len(self.trades)
+            'n_trades': len(self.trades),
+            'last_trade': self.trades[-1] if self.trades else None,
         }
         
         return observation, reward, terminated, truncated, info
     
     def render(self, mode='human'):
         """Render the environment"""
-        current_price = self.df['close'].iloc[self.current_step]
+        safe_idx = min(self.current_step, len(self.df) - 1)
+        current_price = self.df['close'].iloc[safe_idx]
         current_value = self.balance + (self.btc_held * current_price)
         profit = current_value - self.initial_balance
         profit_pct = (profit / self.initial_balance) * 100

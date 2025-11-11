@@ -1,0 +1,15 @@
+{
+  "episode_number": 5,
+  "epsilon": 0.6369088258938781,
+  "device": "cuda",
+  "gpu_available": true,
+  "reward": -0.29628171083114246,
+  "loss": 0.028853315771335646,
+  "steps": 21,
+  "portfolio_value": 7037.182891688575,
+  "profit": -2962.817108311425,
+  "n_trades": 14,
+  "timestamp": "2025-11-10T17:16:11.585379Z",
+  "running": true,
+  "agent_id": "DQN-fix-steps"
+}

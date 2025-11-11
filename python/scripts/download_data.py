@@ -3,6 +3,7 @@ Script para download de dados históricos de Bitcoin
 """
 import ccxt
 import pandas as pd
+import os
 from datetime import datetime, timedelta
 import logging
 
@@ -14,7 +15,7 @@ def download_bitcoin_data(
     symbol: str = 'BTC/USDT',
     timeframe: str = '1h',
     days_back: int = 730,
-    output_file: str = 'data/bitcoin_historical.csv'
+    output_file: str = 'python/data/bitcoin_historical.csv'
 ):
     """
     Download historical Bitcoin data from Binance
@@ -43,7 +44,9 @@ def download_bitcoin_data(
         while True:
             logger.info(f"Fetching data from {datetime.fromtimestamp(since/1000)}")
             
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since)
+            # Fetch up to 1000 candles per request for faster backfill
+            limit = 1000
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=limit)
             
             if len(ohlcv) == 0:
                 break
@@ -51,7 +54,7 @@ def download_bitcoin_data(
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
             
-            if len(ohlcv) < 1000:  # No more data
+            if len(ohlcv) < limit:  # No more data
                 break
         
         # Convert to DataFrame
@@ -63,7 +66,8 @@ def download_bitcoin_data(
         # Convert timestamp
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # Save
+        # Ensure output directory exists and save
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
         df.to_csv(output_file, index=False)
         
         logger.info(f"✓ Downloaded {len(df)} candles")
