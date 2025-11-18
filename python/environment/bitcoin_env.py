@@ -32,7 +32,14 @@ class BitcoinTradingEnv(gym.Env):
                  max_position_size: float = 0.3,
                  reward_scaling: float = 1.0,
                  slippage_config: SlippageConfig | None = None,
-                 reward_include_fee_penalty: bool = False):
+                 reward_include_fee_penalty: bool = True,
+                 vol_window: int = 50,
+                 sigma_floor: float = 1e-6,
+                 lambda_dd: float = 0.1,
+                 lambda_inv: float = 0.0,
+                 lambda_turn: float = 0.0,
+                 reward_clip_abs: float | None = None,
+                 fee_jitter_pct: float = 0.0):
         """
         Args:
             df: DataFrame with market data and features
@@ -52,6 +59,13 @@ class BitcoinTradingEnv(gym.Env):
         self.reward_scaling = reward_scaling
         self.slippage_config = slippage_config or SlippageConfig()
         self.reward_include_fee_penalty = reward_include_fee_penalty
+        self.vol_window = vol_window
+        self.sigma_floor = sigma_floor
+        self.lambda_dd = lambda_dd
+        self.lambda_inv = lambda_inv
+        self.lambda_turn = lambda_turn
+        self.reward_clip_abs = reward_clip_abs
+        self.fee_jitter_pct = fee_jitter_pct
         
         # Get feature columns (exclude OHLCV and timestamp)
         self.feature_cols = [col for col in df.columns 
@@ -84,6 +98,8 @@ class BitcoinTradingEnv(gym.Env):
         self.rng: Generator | None = None
         self.risk_manager = RiskManager(max_position_size=max_position_size)
         self.entry_price: float | None = None
+        self.prev_drawdown: float = 0.0
+        self.prev_btc_held: float = 0.0
         
         logger.info(f"Environment initialized with {self.max_steps} steps")
     
@@ -98,6 +114,8 @@ class BitcoinTradingEnv(gym.Env):
         self.trades = []
         self.rng = default_rng(seed if seed is not None else 42)
         self.entry_price = None
+        self.prev_drawdown = 0.0
+        self.prev_btc_held = 0.0
         
         return self._get_observation(), {}
     
@@ -129,7 +147,7 @@ class BitcoinTradingEnv(gym.Env):
         
         return observation.astype(np.float32)
     
-    def _calculate_reward(self, action: int, previous_value: float) -> float:
+    def _calculate_reward(self, action: int, previous_value: float, delta_position: float) -> float:
         """
         Calculate reward for the action taken
         """
@@ -142,16 +160,44 @@ class BitcoinTradingEnv(gym.Env):
         value_change = (current_value - previous_value) / self.initial_balance
         
         # Fees/slippage already applied directly in balance and holdings.
-        cost_penalty = self.transaction_cost if (self.reward_include_fee_penalty and action != 0) else 0.0
+        cost_penalty = 0.0
+        if self.reward_include_fee_penalty and action != 0 and self.trades:
+            lt = self.trades[-1]
+            fee = float(lt.get('fee', 0.0) or 0.0)
+            amt = float(lt.get('amount', 0.0) or 0.0)
+            px = float(lt.get('price', current_price) or current_price)
+            slip_bps = float(lt.get('slippage_bps', 0.0) or 0.0)
+            slip_cost = (px * amt) * (abs(slip_bps) / 10000.0)
+            cost_penalty = (fee + slip_cost) / max(self.initial_balance, 1e-12)
         
         # Risk-adjusted return (penalize excessive exposure)
         position_ratio = (self.btc_held * current_price) / current_value if current_value > 0 else 0
         risk_penalty = 0.0
         if position_ratio > self.max_position_size:
             risk_penalty = (position_ratio - self.max_position_size) * 0.1
+        if self.lambda_inv > 0.0:
+            risk_penalty += self.lambda_inv * abs(position_ratio)
+
+        dd_prev = self.prev_drawdown
+        dd_cur = self.risk_manager.update_drawdown(current_value)
+        dd_delta = max(0.0, dd_cur - dd_prev)
+        dd_penalty = self.lambda_dd * dd_delta
+
+        turnover_penalty = self.lambda_turn * abs(delta_position)
+
+        prices = self.df['close'].values
+        start_idx = max(self.current_step - self.vol_window, 1)
+        end_idx = self.current_step
+        rets = np.diff(prices[start_idx-1:end_idx]) / prices[start_idx-1:end_idx-1] if end_idx - start_idx > 1 else np.array([0.0])
+        sigma = float(np.std(rets))
+        sigma_target = max(sigma, self.sigma_floor)
         
         # Combined reward
-        reward = (value_change - cost_penalty - risk_penalty) * self.reward_scaling
+        base = (value_change - cost_penalty - risk_penalty - dd_penalty - turnover_penalty)
+        reward = (base / sigma_target) * self.reward_scaling
+        if self.reward_clip_abs is not None:
+            reward = float(np.clip(reward, -abs(self.reward_clip_abs), abs(self.reward_clip_abs)))
+        self.prev_drawdown = dd_cur
         
         return reward
     
@@ -167,6 +213,7 @@ class BitcoinTradingEnv(gym.Env):
         """
         current_price = self.df['close'].iloc[self.current_step]
         previous_value = self.balance + (self.btc_held * current_price)
+        self.prev_btc_held = self.btc_held
         
         # Execute action with slippage & fees; enforce risk constraints
         if action == 1:  # Buy
@@ -188,7 +235,8 @@ class BitcoinTradingEnv(gym.Env):
                     self.rng,
                     self.slippage_config,
                 )
-                executed_price, cost, fee = apply_buy(current_price, buy_amount, self.transaction_cost, slip_bps)
+                eff_fee_rate = self.transaction_cost * (1.0 + (self.rng.normal(0.0, self.fee_jitter_pct) if self.fee_jitter_pct > 0 else 0.0))
+                executed_price, cost, fee = apply_buy(current_price, buy_amount, eff_fee_rate, slip_bps)
                 if self.balance >= cost:
                     self.balance -= cost
                     self.btc_held += buy_amount
@@ -218,7 +266,8 @@ class BitcoinTradingEnv(gym.Env):
                     self.rng,
                     self.slippage_config,
                 )
-                executed_price, revenue, fee = apply_sell(current_price, sell_amount, self.transaction_cost, slip_bps)
+                eff_fee_rate = self.transaction_cost * (1.0 + (self.rng.normal(0.0, self.fee_jitter_pct) if self.fee_jitter_pct > 0 else 0.0))
+                executed_price, revenue, fee = apply_sell(current_price, sell_amount, eff_fee_rate, slip_bps)
                 self.balance += revenue
                 self.btc_held -= sell_amount
 
@@ -255,7 +304,8 @@ class BitcoinTradingEnv(gym.Env):
                     self.rng,
                     self.slippage_config,
                 )
-                executed_price, revenue, fee = apply_sell(current_price, sell_amount, self.transaction_cost, slip_bps)
+                eff_fee_rate = self.transaction_cost * (1.0 + (self.rng.normal(0.0, self.fee_jitter_pct) if self.fee_jitter_pct > 0 else 0.0))
+                executed_price, revenue, fee = apply_sell(current_price, sell_amount, eff_fee_rate, slip_bps)
                 self.balance += revenue
                 self.btc_held = 0.0
                 profit_loss = (executed_price - self.entry_price) * sell_amount - fee
@@ -277,7 +327,8 @@ class BitcoinTradingEnv(gym.Env):
         self.current_step += 1
         
         # Calculate reward
-        reward = self._calculate_reward(action, previous_value)
+        delta_position = self.btc_held - self.prev_btc_held
+        reward = self._calculate_reward(action, previous_value, delta_position)
         
         # Check if episode is done (atingiu último índice disponível)
         terminated = self.current_step >= self.max_steps
@@ -288,6 +339,16 @@ class BitcoinTradingEnv(gym.Env):
         
         # Info dict
         current_value = self.balance + (self.btc_held * current_price)
+        info_cost_t = 0.0
+        if self.reward_include_fee_penalty and action != 0 and self.trades:
+            lt = self.trades[-1]
+            fee_i = float(lt.get('fee', 0.0) or 0.0)
+            amt_i = float(lt.get('amount', 0.0) or 0.0)
+            px_i = float(lt.get('price', current_price) or current_price)
+            slip_bps_i = float(lt.get('slippage_bps', 0.0) or 0.0)
+            slip_cost_i = (px_i * amt_i) * (abs(slip_bps_i) / 10000.0)
+            info_cost_t = (fee_i + slip_cost_i) / max(self.initial_balance, 1e-12)
+
         info = {
             'total_value': current_value,
             'profit': current_value - self.initial_balance,
@@ -295,6 +356,11 @@ class BitcoinTradingEnv(gym.Env):
             'btc_held': self.btc_held,
             'n_trades': len(self.trades),
             'last_trade': self.trades[-1] if self.trades else None,
+            'sigma_target': sigma_target if 'sigma_target' in locals() else None,
+            'drawdown': self.prev_drawdown,
+            'dd_delta': dd_delta if 'dd_delta' in locals() else None,
+            'turnover': abs(delta_position),
+            'cost_t': info_cost_t,
         }
         
         return observation, reward, terminated, truncated, info

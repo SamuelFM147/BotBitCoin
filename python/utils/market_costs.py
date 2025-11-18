@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 class SlippageConfig:
     mu_bps: float = 2.0               # baseline slippage (bps)
     sigma_bps: float = 1.0            # randomness (bps)
-    scale_with_volatility: bool = True
+    scale_with_volatility: bool = False
     vol_window: int = 20              # window for realized volatility
     size_sensitivity: float = 0.0     # bps per unit of (amount / 1 BTC)
 
@@ -58,7 +58,7 @@ def compute_slippage_bps(
     size_bps = config.size_sensitivity * max(0.0, amount)
 
     noise = rng.normal(loc=0.0, scale=config.sigma_bps)
-    slip_bps = max(0.0, base + 0.25 * vol_bps + size_bps + noise)
+    slip_bps = max(0.0, base + 1.0 * vol_bps + size_bps + noise)
 
     return float(slip_bps)
 

@@ -15,19 +15,30 @@ class EnvironmentConfig:
     transaction_cost: float = 0.001  # 0.1% transaction fee
     reward_scaling: float = 1.0
     lookback_window: int = 50  # Number of past observations
+    reward_include_fee_penalty: bool = True
+    vol_window: int = 20
+    sigma_floor: float = 1e-6
+    lambda_dd: float = 0.40
+    lambda_inv: float = 0.001
+    lambda_turn: float = 0.006
+    reward_clip_abs: float | None = 3.0
+    fee_jitter_pct: float = 0.0005
+    env_id: str = "ohlcv_discrete"
+    orderbook_levels: int = 5
+    use_orderbook_synthetic: bool = True
     
 
 @dataclass
 class DQNConfig:
     """Deep Q-Network configuration"""
-    learning_rate: float = 0.0001
+    learning_rate: float = 0.0003
     gamma: float = 0.99  # Discount factor
-    epsilon_start: float = 1.0
-    epsilon_end: float = 0.01
-    epsilon_decay: float = 0.995
+    epsilon_start: float = 0.7
+    epsilon_end: float = 0.05
+    epsilon_decay: float = 0.997
     buffer_size: int = 100000
     batch_size: int = 64
-    target_update_freq: int = 1000
+    target_update_freq: int = 250
     hidden_layers: list = None
     
     def __post_init__(self):
@@ -47,20 +58,22 @@ class PPOConfig:
     n_epochs: int = 10
     ent_coef: float = 0.01
     vf_coef: float = 0.5
+    device: str = "cpu"
+    policy_name: str = "mlp"
 
 
 @dataclass
 class TrainingConfig:
     """Training process configuration"""
     total_episodes: int = 5000
-    eval_frequency: int = 100
+    eval_frequency: int = 20
     checkpoint_frequency: int = 500
     early_stopping_patience: int = 50
     min_episodes_before_stopping: int = 1000
     log_dir: str = "logs"
     checkpoint_dir: str = "checkpoints"
     # Optional cap to speed up training by limiting steps per episode
-    max_steps_per_episode: int | None = None
+    max_steps_per_episode: int | None = 26
     
 
 @dataclass

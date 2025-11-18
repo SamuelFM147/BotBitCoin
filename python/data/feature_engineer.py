@@ -41,6 +41,12 @@ class FeatureEngineer:
         """Add volume-based features"""
         logger.info("Adding volume features...")
         
+        # Nem todos os datasets possuem coluna de volume (ex.: XAUUSD diário do Yahoo).
+        # Para evitar falhas, sintetizamos um volume dummy quando ausente.
+        if 'volume' not in df.columns:
+            logger.warning("Coluna 'volume' não encontrada; sintetizando volume dummy = 1.0 para criação de *features* de volume.")
+            df['volume'] = 1.0
+        
         # Volume changes
         df['volume_change'] = df['volume'].pct_change()
         

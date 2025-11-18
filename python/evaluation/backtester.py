@@ -7,6 +7,7 @@ from typing import Dict, List, Any
 import logging
 from datetime import datetime
 from utils.risk_manager import RiskManager
+from environment.bitcoin_env import BitcoinTradingEnv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class Backtester:
         self.trades = []
         self.portfolio_values = []
         self.positions = []
+        self.prices = []
         
     def run_backtest(self, 
                     agent,
@@ -67,9 +69,14 @@ class Backtester:
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             
-            # Record portfolio value and position
+            # Record portfolio value, position and price
             self.portfolio_values.append(info['total_value'])
             self.positions.append(info['btc_held'])
+            try:
+                price_idx = max(env.current_step - 1, 0)
+                self.prices.append(float(env.df['close'].iloc[price_idx]))
+            except Exception:
+                self.prices.append(np.nan)
             
             # Record trades
             if len(env.trades) > len(self.trades):
@@ -167,6 +174,15 @@ class Backtester:
             'avg_trade_profit': np.mean([t.get('profit_loss', 0) for t in self.trades]) if self.trades else 0
         }
 
+        try:
+            gross_profit = sum(float(t.get('profit_loss', 0) or 0) for t in self.trades if float(t.get('profit_loss', 0) or 0) > 0)
+            gross_loss = -sum(float(t.get('profit_loss', 0) or 0) for t in self.trades if float(t.get('profit_loss', 0) or 0) < 0)
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+            turnover = sum(abs(float(t.get('amount', 0) or 0) * float(t.get('executed_price', t.get('price', 0)) or 0)) for t in self.trades) / self.initial_balance if self.initial_balance > 0 else 0.0
+            metrics.update({'profit_factor': profit_factor, 'turnover': turnover})
+        except Exception:
+            pass
+
         # Risk metrics (VaR, CVaR, current drawdown, downside deviation)
         try:
             rm = RiskManager()
@@ -174,6 +190,56 @@ class Backtester:
             metrics.update(risk_metrics)
         except Exception as e:
             logger.warning(f"Risk metrics calculation failed: {e}")
+
+        try:
+            if len(self.positions) > 0 and len(self.prices) == len(self.positions):
+                expo = []
+                for i in range(len(self.positions)):
+                    val = self.portfolio_values[i]
+                    pr = self.prices[i]
+                    pos_val = abs(self.positions[i] * pr)
+                    ratio = (pos_val / val) if val > 0 else 0.0
+                    expo.append(ratio)
+                exposure = float(np.mean(expo))
+                metrics['exposure'] = exposure
+        except Exception:
+            pass
+
+        try:
+            fees = [float(t.get('fee', 0) or 0) for t in self.trades]
+            slbps = [abs(float(t.get('slippage_bps', 0) or 0)) for t in self.trades]
+            metrics['avg_fee_per_trade'] = float(np.mean(fees)) if fees else 0.0
+            metrics['avg_slippage_bps'] = float(np.mean(slbps)) if slbps else 0.0
+        except Exception:
+            pass
+
+        try:
+            if len(returns) > 0 and len(self.prices) > 1:
+                bench_ret = np.diff(np.array(self.prices)) / np.array(self.prices[:-1])
+                m = min(len(bench_ret), len(returns))
+                br = bench_ret[:m]
+                sr = returns[:m]
+                var_b = np.var(br)
+                cov = np.cov(sr, br)[0, 1]
+                beta = (cov / var_b) if var_b > 0 else 0.0
+                alpha = float(np.mean(sr) - beta * np.mean(br))
+                metrics['beta_vs_benchmark'] = beta
+                metrics['alpha_vs_benchmark'] = alpha * np.sqrt(252)
+        except Exception:
+            pass
+
+        try:
+            if len(returns) > 0:
+                block = max(10, int(len(returns) / 10))
+                sharpe_blocks = []
+                for i in range(0, len(returns), block):
+                    seg = returns[i:i+block]
+                    if len(seg) > 1 and np.std(seg) > 0:
+                        sharpe_blocks.append(np.sqrt(252) * (np.mean(seg) / np.std(seg)))
+                if sharpe_blocks:
+                    metrics['sharpe_stability'] = float(np.std(sharpe_blocks))
+        except Exception:
+            pass
 
         return metrics
     
@@ -217,6 +283,38 @@ class Backtester:
         df_trades['cumulative_profit'] = df_trades['profit_loss'].cumsum()
         
         return df_trades
+
+    def walk_forward(self,
+                     agent,
+                     df: pd.DataFrame,
+                     lookback_window: int,
+                     window_size: int,
+                     step_size: int,
+                     verbose: bool = True) -> List[Dict[str, Any]]:
+        results = []
+        n = len(df)
+        start = 0
+        while start + window_size <= n:
+            end = start + window_size
+            df_slice = df.iloc[start:end].reset_index(drop=True)
+            env = BitcoinTradingEnv(
+                df_slice,
+                initial_balance=self.initial_balance,
+                lookback_window=lookback_window,
+                transaction_cost=self.transaction_cost,
+                max_position_size=0.3,
+            )
+            _ = self.run_backtest(agent, env, verbose=False)
+            metrics = self.calculate_metrics(env.get_portfolio_summary())
+            results.append({
+                'start': int(start),
+                'end': int(end),
+                'metrics': metrics,
+            })
+            if verbose:
+                logger.info(f"WF [{start}:{end}] Sharpe={metrics.get('sharpe_ratio', 0):.3f} DD={metrics.get('max_drawdown', 0):.2f}% Return={metrics.get('total_return', 0):.2f}%")
+            start += step_size
+        return results
     
     def plot_results(self, save_path: str = None):
         """

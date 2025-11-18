@@ -11,6 +11,7 @@ Enhancements:
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch import amp
 import numpy as np
 from collections import deque
 import random
@@ -210,15 +211,15 @@ class DQNAgent:
     def __init__(self,
                  state_dim: int,
                  action_dim: int,
-                 learning_rate: float = 0.0001,
+                 learning_rate: float = 0.0003,
                  gamma: float = 0.99,
-                 epsilon_start: float = 1.0,
-                 epsilon_end: float = 0.01,
-                 epsilon_decay: float = 0.995,
+                 epsilon_start: float = 0.7,
+                 epsilon_end: float = 0.05,
+                 epsilon_decay: float = 0.997,
                  epsilon_linear_frames: Optional[int] = None,
                  buffer_size: int = 100000,
                  batch_size: int = 64,
-                 target_update_freq: int = 1000,
+                 target_update_freq: int = 250,
                  hidden_layers: list = [256, 256, 128],
                  dueling: bool = True,
                  double_dqn: bool = True,
@@ -226,7 +227,9 @@ class DQNAgent:
                  per_alpha: float = 0.6,
                  per_beta_start: float = 0.4,
                  per_beta_frames: int = 100000,
-                 device: str = None):
+                 device: str = None,
+                 use_amp: bool = True,
+                 accumulate_steps: int = 1):
         """
         Args:
             state_dim: Dimension of state space
@@ -263,6 +266,13 @@ class DQNAgent:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
+        try:
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision('high')
+            if torch.cuda.is_available():
+                torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
         
         logger.info(f"Using device: {self.device}")
         
@@ -275,6 +285,9 @@ class DQNAgent:
         
         # Optimizer
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
+        self.scaler = amp.GradScaler('cuda', enabled=(self.device.type == 'cuda' and use_amp))
+        self.accumulate_steps = max(1, int(accumulate_steps))
+        self._accumulate_counter = 0
         
         # Loss function
         self.criterion = nn.SmoothL1Loss()
@@ -292,6 +305,7 @@ class DQNAgent:
         
         # Training step counter
         self.train_step = 0
+        self.decay_enabled = True
         
         logger.info(f"DQN Agent initialized with state_dim={state_dim}, action_dim={action_dim}")
     
@@ -344,7 +358,8 @@ class DQNAgent:
         dones = torch.FloatTensor(dones).to(self.device)
         
         # Current Q values
-        current_q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        with amp.autocast('cuda', enabled=self.scaler.is_enabled()):
+            current_q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         
         # Next Q values with Double DQN option
         with torch.no_grad():
@@ -356,18 +371,22 @@ class DQNAgent:
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
         
         # Compute loss
-        td_errors = target_q_values - current_q_values
-        if self.use_per:
-            # Weighted Huber loss
-            loss = (weights_t * torch.nn.functional.smooth_l1_loss(current_q_values, target_q_values, reduction='none')).mean()
-        else:
-            loss = self.criterion(current_q_values, target_q_values)
+        with amp.autocast('cuda', enabled=self.scaler.is_enabled()):
+            td_errors = target_q_values - current_q_values
+            if self.use_per:
+                loss = (weights_t * torch.nn.functional.smooth_l1_loss(current_q_values, target_q_values, reduction='none')).mean()
+            else:
+                loss = self.criterion(current_q_values, target_q_values)
         
-        # Optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-        self.optimizer.step()
+        if self._accumulate_counter % self.accumulate_steps == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+        self.scaler.scale(loss).backward()
+        self._accumulate_counter += 1
+        if self._accumulate_counter % self.accumulate_steps == 0:
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self._accumulate_counter = 0
         
         # Update priorities if PER
         if self.use_per and indices is not None:
@@ -380,13 +399,21 @@ class DQNAgent:
             logger.info(f"Target network updated at step {self.train_step}")
         
         # Decay epsilon (linear optional)
-        if self.epsilon_linear_frames is not None and self.train_step < self.epsilon_linear_frames:
-            decay_per_step = (self.epsilon_start - self.epsilon_end) / max(1, self.epsilon_linear_frames)
-            self.epsilon = max(self.epsilon_end, self.epsilon - decay_per_step)
-        else:
-            self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        
+        if self.decay_enabled:
+            if self.epsilon_linear_frames is not None and self.train_step < self.epsilon_linear_frames:
+                decay_per_step = (self.epsilon_start - self.epsilon_end) / max(1, self.epsilon_linear_frames)
+                self.epsilon = max(self.epsilon_end, self.epsilon - decay_per_step)
+            else:
+                self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+
         return loss.item()
+
+    def set_accumulate_steps(self, steps: int):
+        self.accumulate_steps = max(1, int(steps))
+        self._accumulate_counter = 0
+
+    def set_decay_enabled(self, enabled: bool):
+        self.decay_enabled = bool(enabled)
     
     def save(self, filepath: str):
         """Save agent to file"""

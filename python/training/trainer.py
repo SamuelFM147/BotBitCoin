@@ -32,7 +32,11 @@ class Trainer:
                  checkpoint_dir: str = "checkpoints",
                  supabase_client=None,
                  agent_id: str = "DQN-v2.1",
-                 max_steps_per_episode: int | None = None):
+                 max_steps_per_episode: int | None = None,
+                 exploration_episodes: int = 50,
+                 drawdown_max: float | None = None,
+                 updates_per_step: int = 1,
+                 num_envs: int | None = None):
         """
         Args:
             agent: RL agent to train
@@ -55,6 +59,15 @@ class Trainer:
         self.early_stopping_patience = early_stopping_patience
         self.min_episodes_before_stopping = min_episodes_before_stopping
         self.max_steps_per_episode = max_steps_per_episode
+        # Escalonar exploração conforme total_episodes; auto-reduzir para episódios curtos
+        scaled_exploration = int(min(exploration_episodes, max(5, total_episodes // 10)))
+        if int(total_episodes) < 50:
+            scaled_exploration = int(max(1, min(exploration_episodes, total_episodes // 2)))
+        self.exploration_episodes = scaled_exploration
+        self.drawdown_max = drawdown_max
+        self.updates_per_step = max(1, int(updates_per_step))
+        self.num_envs = int(num_envs) if num_envs is not None else (getattr(env, 'num_envs', 1) if hasattr(env, 'num_envs') else 1)
+        self.is_vector = bool(hasattr(env, 'num_envs'))
         
         # Create directories
         self.log_dir = log_dir
@@ -102,40 +115,153 @@ class Trainer:
         steps = 0
         done = False
         start_time = datetime.utcnow()
+        values_series = []
+        action_counts = {0: 0, 1: 0, 2: 0}
         
-        while not done:
-            # Select and perform action
-            action = self.agent.select_action(state, training=True)
-            next_state, reward, terminated, truncated, info = self.env.step(action)
-            done = terminated or truncated
-            
-            # Store transition
-            self.agent.store_transition(state, action, reward, next_state, done)
-            
-            # Train agent
-            loss = self.agent.train()
-            
-            episode_reward += reward
-            episode_loss += loss
-            steps += 1
-            state = next_state
+        peak_value = None
+        if not self.is_vector:
+            while not done:
+                action = self.agent.select_action(state, training=True)
+                next_state, reward, terminated, truncated, info = self.env.step(action)
+                done = terminated or truncated
+                action_counts[int(action)] = action_counts.get(int(action), 0) + 1
+                self.agent.store_transition(state, action, reward, next_state, done)
+                loss_acc = 0.0
+                for _ in range(int(self.updates_per_step)):
+                    loss_acc += self.agent.train()
+                loss = loss_acc / max(1, int(self.updates_per_step))
+                episode_reward += reward
+                episode_loss += loss
+                steps += 1
+                state = next_state
+                try:
+                    values_series.append(float(info.get('total_value', 0.0)))
+                except Exception:
+                    pass
 
-            # Optional cap to speed up episodes
-            if self.max_steps_per_episode is not None and steps >= int(self.max_steps_per_episode):
-                truncated = True
-                done = True
+                if hasattr(self.agent, 'set_decay_enabled'):
+                    self.agent.set_decay_enabled(self._episode_idx >= self.exploration_episodes)
+
+                if self.drawdown_max is not None and self._episode_idx >= self.exploration_episodes:
+                    current_value = float(info.get('total_value', 0.0))
+                    if peak_value is None:
+                        peak_value = current_value if current_value > 0 else self.env.initial_balance
+                    peak_value = max(peak_value, current_value)
+                    dd = 0.0
+                    if peak_value > 0:
+                        dd = max(0.0, (peak_value - current_value) / peak_value)
+                    if dd >= float(self.drawdown_max):
+                        truncated = True
+                        done = True
+                        info['risk_stop'] = True
+
+                if self.max_steps_per_episode is not None and steps >= int(self.max_steps_per_episode):
+                    truncated = True
+                    done = True
+        else:
+            terminated_all = np.array([False] * int(self.num_envs))
+            truncated_all = np.array([False] * int(self.num_envs))
+            last_infos = None
+            while not bool(np.all(terminated_all | truncated_all)):
+                actions = []
+                for i in range(int(self.num_envs)):
+                    actions.append(self.agent.select_action(state[i], training=True))
+                    action_counts[int(actions[-1])] = action_counts.get(int(actions[-1]), 0) + 1
+                next_state, rewards, terminated, truncated, infos = self.env.step(np.array(actions))
+                last_infos = infos
+                for i in range(int(self.num_envs)):
+                    self.agent.store_transition(state[i], int(actions[i]), float(rewards[i]), next_state[i], bool(terminated[i] or truncated[i]))
+                loss_acc = 0.0
+                for _ in range(int(self.updates_per_step)):
+                    loss_acc += self.agent.train()
+                loss = loss_acc / max(1, int(self.updates_per_step))
+                episode_reward += float(np.mean(rewards))
+                episode_loss += loss
+                steps += 1
+                state = next_state
+                try:
+                    vals = []
+                    if isinstance(infos, (list, tuple)):
+                        for inf in infos:
+                            vals.append(float(inf.get('total_value', 0.0)))
+                    values_series.append(float(np.mean(vals)) if vals else 0.0)
+                except Exception:
+                    pass
+                terminated_all = np.array(terminated)
+                truncated_all = np.array(truncated)
+                if hasattr(self.agent, 'set_decay_enabled'):
+                    self.agent.set_decay_enabled(self._episode_idx >= self.exploration_episodes)
+                if self.max_steps_per_episode is not None and steps >= int(self.max_steps_per_episode):
+                    truncated_all = np.array([True] * int(self.num_envs))
         
         avg_loss = episode_loss / steps if steps > 0 else 0
         duration_seconds = (datetime.utcnow() - start_time).total_seconds()
+        # Métricas adicionais
+        sharpe = 0.0
+        calmar = 0.0
+        entropy = 0.0
+        action_dist = {'hold': 0.0, 'buy': 0.0, 'sell': 0.0}
+        if steps > 0:
+            # Distribuição e entropia
+            p_hold = action_counts.get(0, 0) / steps
+            p_buy = action_counts.get(1, 0) / steps
+            p_sell = action_counts.get(2, 0) / steps
+            action_dist = {'hold': p_hold, 'buy': p_buy, 'sell': p_sell}
+            for p in (p_hold, p_buy, p_sell):
+                if p > 1e-12:
+                    entropy -= float(p) * float(np.log(p))
+            # Sharpe e Calmar pela série de valor de portfólio
+            if len(values_series) >= 2:
+                v0 = values_series[0]
+                rets = np.diff(values_series) / np.clip(values_series[:-1], 1e-12, None)
+                mu = float(np.mean(rets))
+                sd = float(np.std(rets))
+                sharpe = float(mu / sd) if sd > 0 else 0.0
+                final_ret = (values_series[-1] / max(v0, 1e-12)) - 1.0
+                # Max drawdown
+                running_max = np.maximum.accumulate(values_series)
+                dd = (running_max - np.array(values_series)) / np.clip(running_max, 1e-12, None)
+                max_dd = float(np.max(dd)) if dd.size > 0 else 0.0
+                calmar = float(final_ret / max_dd) if max_dd > 1e-12 else 0.0
+        # Win rate e PnL médio por trade a partir do ambiente
+        trades = getattr(self.env, 'trades', []) or []
+        trade_pnls = [float(t.get('profit_loss')) for t in trades if t.get('profit_loss') is not None]
+        win_rate = float(np.mean([1.0 if pnl > 0 else 0.0 for pnl in trade_pnls])) if trade_pnls else 0.0
+        avg_trade_pnl = float(np.mean(trade_pnls)) if trade_pnls else 0.0
         
+        if not self.is_vector:
+            pv = info.get('total_value', 0)
+            pf = info.get('profit', 0)
+            nt = info.get('n_trades', 0)
+        else:
+            pv = 0
+            pf = 0
+            nt = 0
+            if isinstance(last_infos, (list, tuple)) and last_infos:
+                vals = []
+                profs = []
+                trades_ct = []
+                for inf in last_infos:
+                    vals.append(float(inf.get('total_value', 0)))
+                    profs.append(float(inf.get('profit', 0)))
+                    trades_ct.append(int(inf.get('n_trades', 0)))
+                pv = float(np.mean(vals)) if vals else 0.0
+                pf = float(np.mean(profs)) if profs else 0.0
+                nt = int(np.sum(trades_ct)) if trades_ct else 0
         return {
             'reward': episode_reward,
             'loss': avg_loss,
             'steps': steps,
-            'portfolio_value': info.get('total_value', 0),
-            'profit': info.get('profit', 0),
-            'n_trades': info.get('n_trades', 0),
-            'duration_seconds': duration_seconds
+            'portfolio_value': pv,
+            'profit': pf,
+            'n_trades': nt,
+            'duration_seconds': duration_seconds,
+            'sharpe': sharpe,
+            'calmar': calmar,
+            'win_rate': win_rate,
+            'avg_trade_pnl': avg_trade_pnl,
+            'action_distribution': action_dist,
+            'entropy': entropy,
         }
     
     def evaluate(self, n_episodes: int = 5) -> Dict[str, float]:
@@ -191,6 +317,7 @@ class Trainer:
         
         for episode in pbar:
             # Train one episode
+            self._episode_idx = int(episode)
             stats = self.train_episode()
             
             # Log statistics
@@ -222,9 +349,9 @@ class Trainer:
                     )
                     episode_row = resp.get('episode') or {}
                     episode_id = episode_row.get('id')
-                    # Persist trades if the environment exposes them
+                    # Persist trades best-effort, mesmo se lista vazia
                     trades = getattr(self.env, 'trades', [])
-                    if episode_id is not None and trades:
+                    if episode_id is not None:
                         self.supabase.save_trades_batch(
                             agent_id=self.agent_id,
                             episode_id=episode_id,
@@ -252,16 +379,22 @@ class Trainer:
                 logger.info(f"  Eval Trades: {eval_stats['mean_trades']:.1f}")
                 
                 # Check for improvement
-                if eval_stats['mean_reward'] > self.best_reward:
+                valid_eval = (eval_stats['mean_reward'] > 0.0) and (eval_stats['mean_trades'] > 0.0)
+                if eval_stats['mean_reward'] > self.best_reward and valid_eval:
                     self.best_reward = eval_stats['mean_reward']
                     self.episodes_without_improvement = 0
-                    
-                    # Save best model
+                    # Save best model apenas se avaliação for válida (lucro/negociação)
                     best_model_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
                     self.agent.save(best_model_path)
                     logger.info(f"  New best model saved! Reward: {self.best_reward:.2f}")
                 else:
                     self.episodes_without_improvement += self.eval_frequency
+                    # Aumenta dinamicamente updates_per_step em cenários ruins
+                    if not valid_eval:
+                        new_ups = min(self.updates_per_step * 2, 8)
+                        if new_ups != self.updates_per_step:
+                            logger.info(f"  Increasing updates_per_step {self.updates_per_step} -> {new_ups} devido a avaliação ruim")
+                            self.updates_per_step = new_ups
                 
                 # Early stopping
                 if (episode >= self.min_episodes_before_stopping and 
@@ -344,6 +477,14 @@ class Trainer:
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'running': True,
                 'agent_id': self.agent_id,
+                'updates_per_step': int(self.updates_per_step),
+                # Métricas estendidas
+                'sharpe': float(stats.get('sharpe', 0.0)),
+                'calmar': float(stats.get('calmar', 0.0)),
+                'win_rate': float(stats.get('win_rate', 0.0)),
+                'avg_trade_pnl': float(stats.get('avg_trade_pnl', 0.0)),
+                'action_distribution': stats.get('action_distribution', {'hold': 0.0, 'buy': 0.0, 'sell': 0.0}),
+                'entropy': float(stats.get('entropy', 0.0)),
             }
             status_path = os.path.join(self.public_dir, 'training_status.json')
             with open(status_path, 'w') as f:
